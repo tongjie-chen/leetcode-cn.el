@@ -1,0 +1,7 @@
+This file is modified from https://github.com/kaiwk/leetcode.el.
+
+This has not used aio package or async yet for easier debugging if it does not work on your computer.
+
+You will need to login on your browser and get the cookie for ~LEETCODE_SESSION~ and ~csrftoken~.
+
+This runs in English on my computer. Problems in Chinese shows the same as website if it is blank. Have not figured out a way to change the language to Chinese.
