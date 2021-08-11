@@ -380,6 +380,8 @@ OPERATION and VARS are LeetCode GraphQL parameters."
             dislikes
             content
             sampleTestCase
+	    translatedContent
+	    similarQuestions
             (topicTags slug)
             (codeSnippets langSlug code)))))
    (if vars (cons "variables" vars))))
@@ -955,35 +957,40 @@ Use `shr-render-buffer' to render problem description.  This action
 will show the description in other window and jump to it."
   (let* ((problem-id (plist-get problem-info :id))
          (title (plist-get problem-info :title))
+	 (status (plist-get problem-info :status))
          (difficulty-level (plist-get problem-info :difficulty))
+	 (tags (plist-get problem-info :tags))
          (difficulty (leetcode--stringify-difficulty difficulty-level))
          (buf-name leetcode--description-buffer-name)
          (html-margin "&nbsp;&nbsp;&nbsp;&nbsp;"))
     (leetcode--debug "select title: %s" title)
+    (setq leetcode--current-problem-id problem-id)
     (let-alist problem
       (when (get-buffer buf-name)
         (kill-buffer buf-name))
       (with-temp-buffer
         (insert (concat "<h1>" (if (stringp problem-id) problem-id (number-to-string problem-id)) ". " title "</h1>"))
-        (insert (concat (capitalize difficulty) html-margin
-                        "likes: " (if (null .likes) nil (number-to-string .likes)) html-margin
-                        "dislikes: " (if (null .dislikes) nil (number-to-string .dislikes))))
-        (insert .content)
+        (insert (concat
+		 (if (equal status "ac") leetcode--checkmark "×") "  "
+		 (capitalize difficulty) html-margin
+                 "likes: " (number-to-string .likes) html-margin
+                 "dislikes: " (number-to-string .dislikes)))
+        (if leetcode--translated-language (insert .translatedContent) (insert .content))
         (setq shr-current-font t)
         (leetcode--replace-in-buffer "" "")
         ;; NOTE: shr.el can't render "https://xxxx.png", so we use "http"
         (leetcode--replace-in-buffer "https" "http")
-        (shr-render-buffer (current-buffer))))
+        (shr-render-buffer (current-buffer)))
       (with-current-buffer "*html*"
         (save-match-data
           (re-search-forward "dislikes: .*" nil t)
           (insert (make-string 4 ?\s))
-          (insert-text-button "solve it"
+          (insert-text-button "Solve it"
                               'action (lambda (btn)
                                         (leetcode--start-coding problem problem-info))
                               'help-echo "solve the problem.")
           (insert (make-string 4 ?\s))
-          (insert-text-button "link"
+          (insert-text-button "Link"
                               'action (lambda (btn)
                                         (browse-url (leetcode--problem-link title)))
                               'help-echo "open the problem in browser.")
@@ -992,11 +999,42 @@ will show the description in other window and jump to it."
                               'action (lambda (btn)
                                         (browse-url (concat (leetcode--problem-link title) "/solution")))
                               'help-echo "Open the problem solution page in browser.")
+	  (insert (make-string 4 ?\s))	  
+	  (insert-text-button "Solution-cn"
+                              'action (lambda (btn)
+                                        (browse-url (replace-regexp-in-string "leetcode.com" "leetcode-cn.com" (concat (leetcode--problem-link title) "/solution") nil t)))
+                              'help-echo "Open the problem solution page in browser.")
+	  (insert "\n")
+	  (cl-loop for tag in tags
+		do (progn (insert-text-button (concat "+" tag)
+					      'tag tag
+					      'action (lambda (btn)
+							(setq leetcode--filter-tag (button-get btn 'tag))
+							(split-window)
+							(leetcode)
+							(leetcode-refresh))
+					      'help-echo (concat "Show problems for tag " tag))
+			  (insert (make-string 4 ?\s)))
+		)
+	  (insert "\n")
+	  (mapc
+	   (lambda (x)
+	     (let-alist x
+	       (insert-text-button (concat "->" .title)
+					      'slug .titleSlug
+					      'action (lambda (btn)
+							(leetcode-show-problem-by-slug .titleSlug)
+							)
+					      'help-echo (concat "Show similar problem " .title))
+	       (insert (make-string 4 ?\s)))
+	       )
+	   (json-parse-string .similarQuestions :object-type 'alist :array-type 'array))
+	  ;; (insert (format "%s" tags))
 	  ;; Would be best to parse the solution in Emacs, but the url-retrieve-synchronously only get the Javascript which generate the solution in HTML, not directly text
 	  )
         (rename-buffer buf-name)
         (leetcode--problem-description-mode)
-        (switch-to-buffer (current-buffer)))))
+        (switch-to-buffer (current-buffer))))))
 
 (defun leetcode-show-problem (problem-id)
   "Show the description of problem with id PROBLEM-ID.
@@ -1005,7 +1043,7 @@ description.  This action will show the description in other
 window and jump to it."
   (interactive (list (read-number "Show problem by problem id: "
                                   (leetcode--get-current-problem-id))))
-  (let* ((problem-info (leetcode--get-problem-by-id problem-id))
+  (let* ((problem-info (leetcode--get-problem-by-id (if (stringp problem-id) problem-id (number-to-string problem-id))))
          (title (plist-get problem-info :title))
          (problem  (leetcode--fetch-problem title)))
     (leetcode--show-problem problem problem-info)))
@@ -1108,6 +1146,8 @@ Call `leetcode-solve-problem' on the current problem id."
 (defcustom leetcode-prefer-tag-display t
   "Whether to display tags by default in the *leetcode* buffer."
   :type :boolean)
+
+(defcustom leetcode--translated-language nil "Whether to use translated human language to show question" :type :boolean)
 
 (defvar leetcode--display-tags leetcode-prefer-tag-display
   "(Internal) Whether tags are displayed the *leetcode* buffer.")
@@ -1220,6 +1260,7 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
       (add-to-list 'leetcode--problem-titles title)
       (leetcode--solving-layout)
       (leetcode--set-lang snippets)
+      (leetcode--solve-mode)
       (let* ((slug-title  (leetcode--slugify-title title))
              (buf-name (leetcode--get-code-buffer-name title))
              (code-buf (get-buffer buf-name))
@@ -1239,7 +1280,9 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
                         (goto-char (point-min))
                         (search-forward (string-trim template-code) nil t))
                 (insert template-code))
-              (leetcode--replace-in-buffer "" ""))))
+              (leetcode--replace-in-buffer "" ""))
+	    (leetcode--solve-mode)
+	    ))
 
         (display-buffer code-buf
                         '((display-buffer-reuse-window
@@ -1279,6 +1322,8 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
       (define-key map "s" #'leetcode-set-filter-regex)
       (define-key map "l" #'leetcode-set-prefer-language)
       (define-key map "t" #'leetcode-set-filter-tag)
+      (define-key map "T" #'leetcode-toggle-tag-display)
+      (define-key map "P" #'leetcode-toggle-paid-display)      
       (define-key map "d" #'leetcode-set-filter-difficulty)
       (define-key map "g" #'leetcode-refresh)
       (define-key map "G" #'leetcode-refresh-fetch)
@@ -1306,7 +1351,23 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
 (define-derived-mode leetcode--problem-description-mode
   special-mode "LC Descri"
   "Major mode for display problem description."
-  :group 'leetcode)
+  :group 'leetcode
+  ;; :keymap
+  ;; `(,(kbd "d") . leetcode-solve-problem)
+  )
+
+;; This define-key here is ugly, but seems no other way
+;; this defvar does not work
+(defvar leetcode--problem-description-mode
+  (let ((map (make-sparse-keymap)))
+    (prog1 map
+      (suppress-keymap map)
+      (define-key map "s" (lambda() (interactive) (leetcode-solve-problem leetcode--current-problem-id)))
+      (define-key map "l" (lambda() (interactive) (browse-url (leetcode--problem-link title))))
+      (define-key map "S" (lambda() (interactive) (browse-url (concat (leetcode--problem-link title) "/solution"))))
+      ))
+  "Keymap for `leetcode--problems-mode'.")
+
 
 ;;; Use spinner.el to show progress indicator
 (defvar leetcode--spinner (spinner-create 'progress-bar-filled)
@@ -1322,6 +1383,20 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
   (if leetcode--loading-mode
       (spinner-start leetcode--spinner)
     (spinner-stop leetcode--spinner)))
+
+(define-minor-mode leetcode--solve-mode
+  "Minor mode to submit code."
+  :require 'leetcode
+  :lighter " LC-key"
+  :group 'leetcode
+  :keymap
+  `((,(kbd "C-c v v") . leetcode-submit)
+    (,(kbd "C-c v c") . leetcode-try)
+    (,(kbd "C-c v d") . leetcode)
+    (,(kbd " <C-tab>") . other-window)
+    (,(kbd " <C-iso-lefttab>") . inverse-other-window)
+    )
+)
 
 (provide 'leetcode)
 ;;; leetcode.el ends here
