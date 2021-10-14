@@ -69,6 +69,15 @@
       (leetcode--log-enable-debugging)
       (message "leetcode enable debug"))))
 
+(defun leetcode-toggle-translated-language ()
+  "Change from Chinese to English and fro."
+  (interactive)
+  (setq leetcode--translated-language (not leetcode--translated-language))
+  (condition-case nil
+      (leetcode-show-problem-by-slug (leetcode--slugify-title leetcode--current-problem-title))
+    (error nil))
+  )
+
 (defun leetcode--install-my-cookie ()
   "Install leetcode dependencies."
   (let ((async-shell-command-display-buffer t))
@@ -117,11 +126,17 @@ The elements of :problems has attributes:
 (defvar leetcode--all-tags nil
   "All problems tags.")
 
+(defvar leetcode-cn--problems-cache-file (concat leetcode-directory "/cache/" "leetcode-cn-all-problems.emacs-dump"))
+
+(defvar leetcode--translated-language nil
+  "Whether to use Chinese for showing the content")
+
 (defvar leetcode--problem-titles nil
   "Problem titles that have been open in solving layout.")
 
 (defvar leetcode-retry-threshold 20 "`leetcode-try' or `leetcode-submit' retry times.")
 (defvar leetcode--filter-regex nil "Filter rows by regex.")
+(defvar leetcode--filter-numbers nil "Filter rows by the No. of question.")
 (defvar leetcode--filter-tag nil "Filter rows by tag.")
 (defvar leetcode--filter-difficulty nil
   "Filter rows by difficulty, it can be \"easy\", \"medium\" and \"hard\".")
@@ -129,7 +144,7 @@ The elements of :problems has attributes:
 
 (defconst leetcode--paid "•" "Paid mark.")
 (defconst leetcode--checkmark "✓" "Checkmark for accepted problem.")
-(defconst leetcode--buffer-name             "*leetcode*")
+(defconst leetcode--buffer-name             "*leetcode-cn*")
 (defconst leetcode--description-buffer-name "*leetcode-description*")
 (defconst leetcode--testcase-buffer-name    "*leetcode-testcase*")
 (defconst leetcode--result-buffer-name      "*leetcode-result*")
@@ -161,7 +176,7 @@ The elements of :problems has attributes:
 
 ;;; Login
 ;; URL
-(defconst leetcode--domain    "leetcode-cn.com")
+(defconst leetcode--domain    ".leetcode-cn.com")
 (defconst leetcode--base-url  "https://leetcode-cn.com")
 (defconst leetcode--url-login (concat leetcode--base-url "/accounts/login"))
 
@@ -256,26 +271,27 @@ VALUE should be the referer."
 (defun leetcode--login ()
   "Steal LeetCode login session from local browser.
 It also cleans LeetCode cookies in `url-cookie-file'."
+  (interactive)
   (leetcode--loading-mode t)
-  ;; (ignore-errors (url-cookie-delete-cookies leetcode--domain))
-  ;;  (leetcode--csrf-token)    ;knock knock, whisper me the mysterious information
-  ;; (let* ((my-cookies (executable-find "my_cookies"))
-  ;;        (my-cookies-output (shell-command-to-string my-cookies))
-  ;;        (cookies-list (seq-filter
-  ;;                       (lambda (s) (not (string-empty-p s)))
-  ;;                       (split-string my-cookies-output "\n")))
-  ;;        (cookies-pairs (seq-map
-  ;;                        (lambda (s) (split-string s))
-  ;;                        cookies-list))
-  ;;        (leetcode-session (cadr (assoc "LEETCODE_SESSION" cookies-pairs)))
-  ;;        (leetcode-csrftoken (cadr (assoc "csrftoken" cookies-pairs))))
-  ;;   ;; (leetcode--debug "login session: %s" leetcode-session)
-  ;;   ;; (leetcode--debug "login csrftoken: %s" leetcode-csrftoken)
-  ;;   ;; (url-cookie-store "LEETCODE_SESSION" leetcode-session nil leetcode--domain "/" t)
-  ;;   ;; (url-cookie-store "csrftoken" leetcode-csrftoken nil leetcode--domain "/" t)
-  ;;   )
-  (url-cookie-store "LEETCODE_SESSION" (read-string "Cookie for LEETCODE_SESSION:") nil leetcode--domain "/" t)
-  (url-cookie-store "csrftoken" (read-string "Cookie for csrftoken:") nil leetcode--domain "/" t)
+  (ignore-errors (url-cookie-delete-cookies leetcode--domain))
+   (leetcode--csrf-token)    ;knock knock, whisper me the mysterious information
+  (let* ((my-cookies (executable-find "my_cookies-leetcode-cn"))
+         (my-cookies-output (shell-command-to-string my-cookies))
+         (cookies-list (seq-filter
+                        (lambda (s) (not (string-empty-p s)))
+                        (split-string my-cookies-output "\n")))
+         (cookies-pairs (seq-map
+                         (lambda (s) (split-string s))
+                         cookies-list))
+         (leetcode-session  (cadr (elt cookies-pairs (- (length cookies-pairs) 2))))
+         (leetcode-csrftoken (cadr (elt cookies-pairs (- (length cookies-pairs) 1)))))
+    (leetcode--debug "login session: %s" leetcode-session)
+    (leetcode--debug "login csrftoken: %s" leetcode-csrftoken)
+    (url-cookie-store "LEETCODE_SESSION" leetcode-session nil leetcode--domain "/" t)
+    (url-cookie-store "csrftoken" leetcode-csrftoken nil leetcode--domain "/" t)
+    )
+  ;; (url-cookie-store "LEETCODE_SESSION" (read-string "Cookie for LEETCODE_SESSION:") nil leetcode--domain "/" t)
+  ;; (url-cookie-store "csrftoken" (read-string "Cookie for csrftoken:") nil leetcode--domain "/" t)
   (leetcode--loading-mode -1))
 
 (defun leetcode--login-p ()
@@ -320,6 +336,7 @@ USER-AND-PROBLEMS is an alist comes from
                         :id .stat.frontend_question_id
                         :backend-id .stat.question_id
                         :title .stat.question__title
+			:frequency .frequency			
 			:slug .stat.question__title_slug
                         :acceptance (format
                                      "%.1f%%"
@@ -382,9 +399,47 @@ OPERATION and VARS are LeetCode GraphQL parameters."
             sampleTestCase
 	    translatedContent
 	    similarQuestions
+	    hints
+	    companyTagStats
             (topicTags slug)
             (codeSnippets langSlug code)))))
    (if vars (cons "variables" vars))))
+
+(defun leetcode--solution-graphql-params (slug)
+  "Construct a GraphQL parameter.
+OPERATION and VARS are LeetCode GraphQL parameters."
+  (list
+   (cons "solutionDetailArticle" slug)
+   (cons "query"
+         (graphql-query
+          questionData
+          (:arguments
+           (($titleSlug . String!))
+           (question
+            :arguments
+            ((titleSlug . ($ titleSlug)))
+            likes
+            dislikes
+            content
+            sampleTestCase
+	    translatedContent
+	    similarQuestions
+	    hints
+	    companyTagStats
+            (topicTags slug)
+            (codeSnippets langSlug code)))))
+   (if vars (cons "variables" vars))))
+
+;; https://stackoverflow.com/questions/2321904/elisp-how-to-save-data-in-a-file
+(defun leetcode-print-to-file (filename data)
+  (with-temp-file filename
+    (prin1 data (current-buffer))))
+
+(defun leetcode-read-from-file (filename)
+  (with-temp-buffer
+    (insert-file-contents filename)
+    (cl-assert (eq (point) (point-min)))
+    (read (current-buffer))))
 
 (defun leetcode--fetch-problem (title)
   "Fetch single problem.
@@ -394,6 +449,16 @@ Return a object with following attributes:
 :dislikes  Number
 :content   String
 :topicTags String"
+  (let ((filename (concat
+		   leetcode-directory "/cache/"
+		   (condition-case nil
+		       (format "%04d" (string-to-number (leetcode--get-problem-id (leetcode--slugify-title title))))
+		     (error (leetcode--get-problem-id (leetcode--slugify-title title))))
+		   "_" (leetcode--slugify-title title) ".html")))
+
+  (if (file-exists-p filename)
+      (leetcode-read-from-file filename)
+      
   (let* ((slug-title (url-encode-url (leetcode--slugify-title title)))
          (url-request-method "POST")
          (url-request-extra-headers
@@ -403,14 +468,19 @@ Return a object with following attributes:
           (json-encode (leetcode--problem-graphql-params
                         "questionData"
                         (list (cons "titleSlug" slug-title)))))
-         (result  (url-retrieve-synchronously leetcode--api-graphql)))
+         (result  (url-retrieve-synchronously leetcode--api-graphql))
     ;; (if-let ((error-info (plist-get (car result) :error)))
     ;;     (progn
     ;;       (switch-to-buffer result)
     ;;       (leetcode--warn "LeetCode fetch problem ERROR: %S" error-info))
-      (with-current-buffer result
+      (question-info (with-current-buffer result
         (goto-char url-http-end-of-headers)
         (alist-get 'question (alist-get 'data (json-read))))))
+      (leetcode-print-to-file filename question-info)
+      question-info
+      )
+    
+    )))
 
 (defun leetcode--replace-in-buffer (regex to)
   "Replace string matched REGEX in `current-buffer' to TO."
@@ -500,6 +570,8 @@ Return a list of rows, each row is a vector:
 		  (plist-get p :acceptance)
 		  ;; difficulty
 		  (leetcode--stringify-difficulty (plist-get p :difficulty))
+		  ;; frequency
+		  (format "%1.2f" (plist-get p :frequency))
 		  ;; tags
 		  (if leetcode--display-tags (string-join (plist-get p :tags) ", ") ""))
 		 rows))
@@ -529,6 +601,8 @@ Return a list of rows, each row is a vector:
 						      (plist-get p :acceptance)
 						      ;; difficulty
 						      (leetcode--stringify-difficulty (plist-get p :difficulty))
+						      ;; frequency
+						      (format "%1.2f" (plist-get p :frequency))
 						      ;; tags
 						      (if leetcode--display-tags (string-join (plist-get p :tags) ", ") ""))
 						     rows))
@@ -537,7 +611,7 @@ Return a list of rows, each row is a vector:
 
 (defun leetcode--row-tags (row)
   "Get tags from ROW."
-  (aref row 5))
+  (aref row 6))
 
 (defun leetcode--row-difficulty (row)
   "Get difficulty from ROW."
@@ -553,6 +627,18 @@ Return a list of rows, each row is a vector:
           (let ((title (aref row 2)))
             (string-match-p leetcode--filter-regex title))
         t)
+      (if leetcode--filter-id-regex
+          (let ((id (aref row 1)))
+            (string-match-p leetcode--filter-id-regex id))
+        t)
+      (if leetcode--filter-numbers
+          (let ((id (aref row 1)))
+            (member id leetcode--filter-numbers))
+        t)
+      (if leetcode--filter-id
+          (let ((id (aref row 1)))
+	    (string-match-p leetcode--filter-id id))
+        t)
       (if leetcode--filter-tag
           (let ((tags (split-string (leetcode--row-tags row) ", ")))
             (member leetcode--filter-tag tags))
@@ -567,6 +653,9 @@ Return a list of rows, each row is a vector:
   "Reset filter."
   (interactive)
   (setq leetcode--filter-regex nil)
+  (setq leetcode--filter-id-regex nil)  
+  ;; (setq leetcode--filter-numbers nil)
+  (setq leetcode--filter-id nil)      
   (setq leetcode--filter-tag nil)
   (setq leetcode--filter-difficulty nil)
   (leetcode-refresh))
@@ -575,6 +664,12 @@ Return a list of rows, each row is a vector:
   "Set `leetcode--filter-regex' as REGEX and refresh."
   (interactive "sSearch: ")
   (setq leetcode--filter-regex regex)
+  (leetcode-refresh))
+
+(defun leetcode-set-filter-id-regex (regex)
+  "Set `leetcode--filter-regex' as REGEX and refresh."
+  (interactive "sSearch: ")
+  (setq leetcode--filter-id-regex regex)
   (leetcode-refresh))
 
 (defun leetcode-set-filter-tag ()
@@ -611,31 +706,35 @@ Return a list of rows, each row is a vector:
 
 (defun leetcode--fetch-user-and-problems ()
   "Fetch user and problems info."
-  (if leetcode--loading-mode
-      (message "LeetCode has been refreshing...")
-    (leetcode--loading-mode t)
-    (let ((url-request-method "GET")
-          (url-request-extra-headers
-           `(,leetcode--User-Agent
-             ,leetcode--X-Requested-With
-             ,(leetcode--referer leetcode--url-login)))
-          (result  (url-retrieve-synchronously leetcode--api-all-problems)))
-      (leetcode--loading-mode -1)
-      ;; (let* ((error-info (and t (plist-get (car result) :error)))) (if error-info (progn (switch-to-buffer (cdr result)) (leetcode--warn "LeetCode fetch user and problems failed: %S" error-info))
-      (save-current-buffer (set-buffer result) (goto-char url-http-end-of-headers) (json-read))      
-      ;; (if-let ((error-info (plist-get (car result) :error)))
-      ;;     (progn
-      ;;       (switch-to-buffer (cdr result))
-      ;;       (leetcode--warn "LeetCode fetch user and problems failed: %S" error-info))
-      ;;   (with-current-buffer (cdr result)
-      ;;     (goto-char url-http-end-of-headers)
-      ;;     (json-read)))
-      )))
+  (if (file-exists-p leetcode-cn--problems-cache-file)
+	(leetcode-read-from-file leetcode-cn--problems-cache-file)
+      (if leetcode--loading-mode
+	  (message "LeetCode has been refreshing...")
+	(leetcode--loading-mode t)
+	(let ((url-request-method "GET")
+              (url-request-extra-headers
+               `(,leetcode--User-Agent
+		 ,leetcode--X-Requested-With
+		 ,(leetcode--referer leetcode--url-login)))
+              (result  (url-retrieve-synchronously leetcode--api-all-problems)))
+	  (leetcode--loading-mode -1)
+	  ;; (let* ((error-info (and t (plist-get (car result) :error)))) (if error-info (progn (switch-to-buffer (cdr result)) (leetcode--warn "LeetCode fetch user and problems failed: %S" error-info))
+	  (let ((problems-cache (save-current-buffer (set-buffer result) (goto-char url-http-end-of-headers) (json-read))))
+	    (leetcode-print-to-file leetcode-cn--problems-cache-file problems-cache)
+	    problems-cache
+	    ;; (if-let ((error-info (plist-get (car result) :error)))
+	    ;;     (progn
+	    ;;       (switch-to-buffer (cdr result))
+	    ;;       (leetcode--warn "LeetCode fetch user and problems failed: %S" error-info))
+	    ;;   (with-current-buffer (cdr result)
+	    ;;     (goto-char url-http-end-of-headers)
+	    ;;     (json-read)))
+	    )))))
 
 (defun leetcode-refresh ()
   "Make `tabulated-list-entries'."
   (interactive)
-  (let* ((header-names '(" " "#" "Problem" "Acceptance" "Difficulty" "Tags"))
+  (let* ((header-names '(" " "#" "Problem" "Acceptance" "Difficulty" "Frequency" "Tags"))
          (rows (leetcode--filter (leetcode--problems-rows)))
          (headers (leetcode--make-tabulated-headers header-names rows)))
     (with-current-buffer (get-buffer-create leetcode--buffer-name)
@@ -648,11 +747,13 @@ Return a list of rows, each row is a vector:
              rows))
       (tabulated-list-init-header)
       (tabulated-list-print t)
+      (message "%s" leetcode--user)
       (leetcode--loading-mode -1))))
 
-(defun leetcode-refresh-fetch ()
+(defun leetcode-refresh-fetch (&optional force)
   "Refresh problems and update `tabulated-list-entries'."
   (interactive)
+  (if force (delete-file leetcode-cn--problems-cache-file))
   (if-let ((users-and-problems  (leetcode--fetch-user-and-problems))
            (all-tags  (leetcode--fetch-all-tags)))
       (progn
@@ -664,6 +765,7 @@ Return a list of rows, each row is a vector:
 
 (defun leetcode--async ()
   "Show leetcode problems buffer."
+  (interactive)
   (if (get-buffer leetcode--buffer-name)
       (switch-to-buffer leetcode--buffer-name)
     (unless (leetcode--login-p)
@@ -698,6 +800,7 @@ LeetCode require slug-title as the request parameters."
   "Asynchronously test the code using customized testcase."
   (interactive)
   (leetcode--loading-mode t)
+  (leetcode--login)
   (let* ((code-buf (current-buffer))
          (testcase-buf (get-buffer leetcode--testcase-buffer-name))
          (slug-title (leetcode--get-slug-title-before-try/submit code-buf))
@@ -737,11 +840,11 @@ LeetCode require slug-title as the request parameters."
               (erase-buffer)
               (insert (concat "Your input:\n" .test_case "\n\n")))
             ;; poll interpreted
-            (let ((actual_res  (leetcode--check-submission .interpret_id slug-title))
+            (let ((actual_res  (leetcode--check-submission .interpret_id slug-title 0))
                   (retry-times 0))
               (while (and (not actual_res) (< retry-times leetcode-retry-threshold))
                  ;; (aio-sleep 0.5)
-                (setq actual_res  (leetcode--check-submission .interpret_id slug-title))
+                (setq actual_res  (leetcode--check-submission .interpret_id slug-title 0))
                 (setq retry-times (1+ retry-times)))
               (if (< retry-times leetcode-retry-threshold)
                   (let-alist actual_res
@@ -749,16 +852,20 @@ LeetCode require slug-title as the request parameters."
                       (goto-char (point-max))
                       (cond
                        ((eq .status_code 10)
+			;; (insert .status_msg)
+                        (insert "\n")			
                         (insert "Output:\n")
                         (dotimes (i (length .code_answer))
                           (insert (aref .code_answer i))
                           (insert "\n"))
                         (insert "\n")
                         (insert "Expected:\n")
+			;; (debug)
                         (dotimes (i (length .expected_code_answer))
                           (insert (aref .expected_code_answer i))
                           (insert "\n"))
-                        (insert "\n"))
+                        (insert "\n")
+			)
                        ((eq .status_code 14)
                         (insert .status_msg))
                        ((eq .status_code 15)
@@ -778,7 +885,7 @@ LeetCode require slug-title as the request parameters."
                 (leetcode--warn "LeetCode try timeout.")))
             (leetcode--loading-mode -1))))))
 
-(defun leetcode--check-submission (submission-id slug-title)
+(defun leetcode--check-submission (submission-id slug-title &optional retry-times)
   "Polling to check submission detail.
 After each submission, either try testcase or submit, LeetCode
 returns a SUBMISSION-ID. With the SUBMISSION-ID, client will poll
@@ -801,8 +908,21 @@ nil."
         (let ((submission-res
                (progn (goto-char url-http-end-of-headers)
                       (json-read))))
-          (if (equal (alist-get 'state submission-res) "SUCCESS")
-              submission-res)))))
+	  ;; (debug)
+	  (message (alist-get 'state submission-res))
+	  (if (< retry-times leetcode-retry-threshold)
+	      (pcase (alist-get 'state submission-res)
+	       ("STARTED" (progn (sleep-for 1) (leetcode--check-submission submission-id slug-title (+ 1 retry-times))))
+	       ("PENDING"  (progn (sleep-for 2) (leetcode--check-submission submission-id slug-title (+ 1 retry-times))))
+	       ("SUCCESS" submission-res)
+	       ))
+          ;; (if (equal (alist-get 'state submission-res) "SUCCESS")
+	  ;;     (progn (message "Retrieving succeed")
+	  ;; 	     submission-res))
+	  ;; (if (equal (alist-get 'state submission-res) "PENDING")
+          ;;    (sleep-for 1)
+	  ;;   )
+	  ))))
 
 (defun leetcode--solving-layout ()
   "Specify layout for solving problem.
@@ -824,6 +944,7 @@ nil."
   (other-window 1)
   (split-window-below)
   (other-window -1)
+  (enlarge-window 14)
   (other-window -1))
 
 (defun leetcode--display-result (buffer &optional alist)
@@ -871,6 +992,7 @@ following possible value:
   (let-alist submission-detail
     (with-current-buffer (get-buffer-create leetcode--result-buffer-name)
       (erase-buffer)
+      ;; (insert (current-time-string))
       (insert (format "Status: %s" .status_msg))
       (cond
        ((eq .status_code 10)
@@ -902,6 +1024,8 @@ following possible value:
   "Asynchronously submit the code and show result."
   (interactive)
   (leetcode--loading-mode t)
+  ;; Because the leetcode-cn refreshes cookies in browser about every 1 hour, so login every time in submission
+  (leetcode--login)
   (let* ((code-buf (current-buffer))
          (code (leetcode--buffer-content code-buf))
          (slug-title (leetcode--get-slug-title-before-try/submit code-buf))
@@ -929,19 +1053,22 @@ following possible value:
       ;;     (progn
       ;;       (leetcode--loading-mode -1)
       ;;       (switch-to-buffer  result)
-      ;;       (leetcode--warn "LeetCode check submit failed: %S" error-info))
+      ;;       (leetcode--warn "LeetCode check submit failed: %S" error-info)))
         (let* ((resp
                 (with-current-buffer result
                   (progn (goto-char url-http-end-of-headers)
+			 ;; (switch-to-buffer result)
+			 ;; (debug)
                          (json-read))))
                (submission-id (alist-get 'submission_id resp))
-               (submission-res  (leetcode--check-submission submission-id slug-title))
+               (submission-res  (leetcode--check-submission submission-id slug-title 0))
                (retry-times 0))
           ;; poll submission result
-          (while (and (not submission-res) (< retry-times leetcode-retry-threshold))
-             ;; (aio-sleep 0.5)
-            (setq submission-res  (leetcode--check-submission submission-id slug-title))
-            (setq retry-times (1+ retry-times)))
+          ;; (while (and (not submission-res) (< retry-times leetcode-retry-threshold))
+          ;;   ;; (aio-sleep 0.5)
+          ;;   (setq submission-res  (leetcode--check-submission submission-id slug-title))
+          ;;   (setq retry-times (1+ retry-times)))
+	  (if (null submission-id) (leetcode-submit))
           (if (< retry-times leetcode-retry-threshold)
               (leetcode--show-submission-result submission-res)
             (leetcode--warn "LeetCode submit timeout."))
@@ -960,26 +1087,31 @@ will show the description in other window and jump to it."
 	 (status (plist-get problem-info :status))
          (difficulty-level (plist-get problem-info :difficulty))
 	 (tags (plist-get problem-info :tags))
+	 (company (plist-get problem-info :tags))
          (difficulty (leetcode--stringify-difficulty difficulty-level))
          (buf-name leetcode--description-buffer-name)
          (html-margin "&nbsp;&nbsp;&nbsp;&nbsp;"))
     (leetcode--debug "select title: %s" title)
     (setq leetcode--current-problem-id problem-id)
+    (setq leetcode--current-problem-title title)    
     (let-alist problem
       (when (get-buffer buf-name)
         (kill-buffer buf-name))
       (with-temp-buffer
         (insert (concat "<h1>" (if (stringp problem-id) problem-id (number-to-string problem-id)) ". " title "</h1>"))
-        (insert (concat
+	;; (setq temp-b .companyTagStats)
+	(insert (concat
 		 (if (equal status "ac") leetcode--checkmark "×") "  "
 		 (capitalize difficulty) html-margin
                  "likes: " (number-to-string .likes) html-margin
                  "dislikes: " (number-to-string .dislikes)))
+	(insert "<br>")
         (if leetcode--translated-language (insert .translatedContent) (insert .content))
         (setq shr-current-font t)
         (leetcode--replace-in-buffer "" "")
         ;; NOTE: shr.el can't render "https://xxxx.png", so we use "http"
         (leetcode--replace-in-buffer "https" "http")
+	;; Tue Aug 31 23:29:33 2021 Emacs can't view the image, maybe due to the redirect to https
         (shr-render-buffer (current-buffer)))
       (with-current-buffer "*html*"
         (save-match-data
@@ -1000,11 +1132,27 @@ will show the description in other window and jump to it."
                                         (browse-url (concat (leetcode--problem-link title) "/solution")))
                               'help-echo "Open the problem solution page in browser.")
 	  (insert (make-string 4 ?\s))	  
-	  (insert-text-button "Solution-cn"
+	  (insert-text-button "Solution-en"
                               'action (lambda (btn)
-                                        (browse-url (replace-regexp-in-string "leetcode.com" "leetcode-cn.com" (concat (leetcode--problem-link title) "/solution") nil t)))
+                                        (browse-url (replace-regexp-in-string "leetcode-cn.com" "leetcode.com" (concat (leetcode--problem-link title) "/solution") nil t)))
                               'help-echo "Open the problem solution page in browser.")
+	  (insert (make-string 4 ?\s))	  	  
+	  (insert-text-button "Open app"
+			      'action (lambda (btn)
+					(let ((cmd (concat "kdeconnect-cli --device xxxxxxxxxx --share " "\"leetcode://umeng.com/leetcode/main/activity?_sdk_=umeng&_linkid_=usr1li8io9vr7c04&LeetCodeUrl=" (url-hexify-string (concat (leetcode--problem-link title) "/solution")) "\"")))
+					(call-process-shell-command cmd nil 0)))
+			      'help-echo "Open in 力扣 app"
+			      )
+	  (insert (make-string 4 ?\s))	  	  
+	  (insert-text-button "Open Anbox"
+			      'action (lambda (btn)
+					(let ((cmd (concat "adb shell am start -a android.intent.action.VIEW -d " "\"leetcode://umeng.com/leetcode/main/activity?_sdk_=umeng\\&_linkid_=usr1li8io9vr7c04\\&LeetCodeUrl=" (url-hexify-string (concat (leetcode--problem-link title) "/solution")) "\"")))
+					  (message "%s" cmd)
+					(call-process-shell-command cmd nil 0)))
+			      'help-echo "Open in 力扣 Anbox app"
+			      )
 	  (insert "\n")
+	  (setq leetcode--current-problem-tags tags)
 	  (cl-loop for tag in tags
 		do (progn (insert-text-button (concat "+" tag)
 					      'tag tag
@@ -1013,7 +1161,7 @@ will show the description in other window and jump to it."
 							(split-window)
 							(leetcode)
 							(leetcode-refresh))
-					      'help-echo (concat "Show problems for tag " tag))
+					      'help-echo (concat "Show problems of tag " tag))
 			  (insert (make-string 4 ?\s)))
 		)
 	  (insert "\n")
@@ -1029,24 +1177,55 @@ will show the description in other window and jump to it."
 	       (insert (make-string 4 ?\s)))
 	       )
 	   (json-parse-string .similarQuestions :object-type 'alist :array-type 'array))
+	  (end-of-buffer)
+	  (insert "\n")
+	  (dotimes (i (seq-length .hints))
+	    ;; (debug)
+	    (insert-text-button (concat "Hint " (number-to-string (+ i 1)))
+			      'hints .hints
+			      'action (lambda (btn)
+					(message (aref (button-get btn 'hints) i)))
+			      'help-echo (concat (aref .hints i)))
+	    (insert "  ")
+	    )
 	  ;; (insert (format "%s" tags))
 	  ;; Would be best to parse the solution in Emacs, but the url-retrieve-synchronously only get the Javascript which generate the solution in HTML, not directly text
+	  ;; This replaces cross reference to other problems
+	  (if (re-search-forward " http://leetcode-cn.com/problems/" nil t)
+	      (progn 
+		(mark-sexp)
+		(let ((problem-slug (buffer-substring-no-properties (region-beginning) (- (region-end) 1))))
+		  (end-of-line)
+		  (insert "\n")
+		  (insert-text-button "Open inside Emacs"
+				      'action (lambda (btn)
+						(leetcode-show-problem-by-slug problem-slug))
+				      'help-echo "Open inside Emacs leetcode description mode.")
+		  (deactivate-mark)
+	    )))
 	  )
+	(beginning-of-buffer)
         (rename-buffer buf-name)
         (leetcode--problem-description-mode)
         (switch-to-buffer (current-buffer))))))
 
-(defun leetcode-show-problem (problem-id)
+(defun leetcode-show-problem (&optional problem-id)
   "Show the description of problem with id PROBLEM-ID.
 Get problem by id and use `shr-render-buffer' to render problem
 description.  This action will show the description in other
 window and jump to it."
-  (interactive (list (read-number "Show problem by problem id: "
+  (interactive (list (read-string "Show problem by problem id: "
                                   (leetcode--get-current-problem-id))))
   (let* ((problem-info (leetcode--get-problem-by-id (if (stringp problem-id) problem-id (number-to-string problem-id))))
          (title (plist-get problem-info :title))
          (problem  (leetcode--fetch-problem title)))
     (leetcode--show-problem problem problem-info)))
+
+(defun leetcode-show-random-problem ()
+  "Find problem-id randomly from tablist view and then leetcode-show-problem"
+  (interactive)
+  (let ((problem-id (plist-get (seq-random-elt (plist-get leetcode--all-problems :problems)) :id)))
+    (leetcode-show-problem problem-id)))
 
 (defun leetcode-show-problem-by-slug (slug-title)
   "Show the description of problem with slug title. This function will work after first run M-x leetcode. This can be used with org-link elisp:(leetcode-show-problem-by-slug \"3sum\").
@@ -1179,7 +1358,7 @@ Default is programming language.")
     ("golang" . ".go") ("java" . ".java") ("javascript" . ".js")
     ("kotlin" . ".kt") ("php" . ".php") ("python" . ".py")
     ("python3" . ".py") ("ruby" . ".rb") ("rust" . ".rs")
-    ("scala" . ".scala") ("swift" . ".swift")
+    ("scala" . ".scala") ("swift" . ".swift") ("typescript" . ".ts")
     ("mysql" . ".sql") ("mssql" . ".sql") ("oraclesql" . ".sql"))
   "LeetCode programming language suffixes.
 c, cpp, csharp, golang, java, javascript, kotlin, php, python,
@@ -1303,6 +1482,11 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
                           (reusable-frames . visible))))
       )))
 
+(defun leetcode-toggle-paid-display ()
+    "DOCSTRING"
+  (interactive)
+  (setq leetcode--display-paid (not leetcode--display-paid)))
+
 (defvar leetcode--problems-mode-map
   (let ((map (make-sparse-keymap)))
     (prog1 map
@@ -1320,13 +1504,17 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
       (define-key map "n" #'next-line)
       (define-key map "p" #'previous-line)
       (define-key map "s" #'leetcode-set-filter-regex)
+      (define-key map "S" #'leetcode-set-filter-id-regex)
+      (define-key map "r" #'leetcode-show-random-problem)
       (define-key map "l" #'leetcode-set-prefer-language)
+      (define-key map "L" #'leetcode-toggle-translated-language)
       (define-key map "t" #'leetcode-set-filter-tag)
       (define-key map "T" #'leetcode-toggle-tag-display)
       (define-key map "P" #'leetcode-toggle-paid-display)      
       (define-key map "d" #'leetcode-set-filter-difficulty)
       (define-key map "g" #'leetcode-refresh)
-      (define-key map "G" #'leetcode-refresh-fetch)
+      ;; (define-key map "G" #'leetcode-refresh-fetch)
+      (define-key map "G" (lambda () (interactive) (leetcode-refresh-fetch t)))
       (define-key map "/" #'leetcode-reset-filter)
       (define-key map "q" #'quit-window)))
   "Keymap for `leetcode--problems-mode'.")
@@ -1345,6 +1533,33 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
     (prog1 map
       (suppress-keymap map)
       (define-key map "n" #'next-line)
+      (define-key map "s" (lambda() (interactive) (leetcode-solve-problem leetcode--current-problem-id)))
+      (define-key map "l" (lambda() (interactive) (browse-url (leetcode--problem-link leetcode--current-problem-title))))
+      (define-key map "S" (lambda() (interactive) (browse-url (concat (leetcode--problem-link leetcode--current-problem-title) "/solution"))))
+      (define-key map "c" (lambda() (interactive) (browse-url (concat (replace-regexp-in-string "leetcode-cn" "leetcode" (leetcode--problem-link leetcode--current-problem-title)) "/solution"))))
+      (define-key map "g" (lambda() (interactive) (browse-url (url-encode-url (concat "https://google.com/?q=" leetcode--current-problem-title)))))
+      (define-key map "o" (lambda() (interactive)
+			    (condition-case nil
+				(org-link-open-as-file (concat "~/org/leetcode.org::" leetcode--current-problem-title) "emacs")
+			      (error
+			       (progn
+				 (find-file "~/org/leetcode.org")
+				 (end-of-buffer)
+				 (insert (concat "* " (if (string-or-null-p leetcode--current-problem-id) leetcode--current-problem-id (number-to-string leetcode--current-problem-id))
+						 ". "))
+				 (org-insert-link nil (concat "elisp:(leetcode-show-problem-by-slug (leetcode--slugify-title" "\"" leetcode--current-problem-title "\"))") leetcode--current-problem-title)
+				 (org-set-tags (mapcar (lambda(tag) (replace-regexp-in-string "-" "_" tag)) leetcode--current-problem-tags))
+				 (org-entry-put (point) "CUSTOM_ID" (concat "Leetcode-" (replace-regexp-in-string " " "-" leetcode--current-problem-title)))
+				 )
+				     )
+			       ))
+	)
+      (define-key map "z" (lambda() (interactive) (leetcode-show-problem (- leetcode--current-problem-id 1))))
+      (define-key map "x" (lambda() (interactive) (leetcode-show-problem (+ leetcode--current-problem-id 1))))
+      (define-key map "<M-p>" (lambda() (interactive) (leetcode-show-problem (- leetcode--current-problem-id 1))))
+      (define-key map "<M-n>" (lambda() (interactive) (leetcode-show-problem (+ leetcode--current-problem-id 1))))
+      (define-key map "r" #'leetcode-show-random-problem)
+      (define-key map "L" (lambda () (interactive) (split-window-right) (follow-mode)))
       (define-key map "p" #'previous-line)))
   "Keymap for `leetcode--problem-description-mode'.")
 
@@ -1355,19 +1570,6 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
   ;; :keymap
   ;; `(,(kbd "d") . leetcode-solve-problem)
   )
-
-;; This define-key here is ugly, but seems no other way
-;; this defvar does not work
-(defvar leetcode--problem-description-mode
-  (let ((map (make-sparse-keymap)))
-    (prog1 map
-      (suppress-keymap map)
-      (define-key map "s" (lambda() (interactive) (leetcode-solve-problem leetcode--current-problem-id)))
-      (define-key map "l" (lambda() (interactive) (browse-url (leetcode--problem-link title))))
-      (define-key map "S" (lambda() (interactive) (browse-url (concat (leetcode--problem-link title) "/solution"))))
-      ))
-  "Keymap for `leetcode--problems-mode'.")
-
 
 ;;; Use spinner.el to show progress indicator
 (defvar leetcode--spinner (spinner-create 'progress-bar-filled)
@@ -1395,8 +1597,9 @@ major mode by `leetcode-prefer-language'and `auto-mode-alist'."
     (,(kbd "C-c v d") . leetcode)
     (,(kbd " <C-tab>") . other-window)
     (,(kbd " <C-iso-lefttab>") . inverse-other-window)
+    (,(kbd "C-c v r") . leetcode-show-random-problem)    
     )
 )
 
-(provide 'leetcode)
+(provide 'leetcode-cn)
 ;;; leetcode.el ends here
